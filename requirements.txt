@@ -1,0 +1,13 @@
+# requirements.txt
+
+# --- AI & Media SDKs ---
+google-generativeai     # For Gemini
+elevenlabs              # For ElevenLabs Voice Synthesis
+ffmpeg-python           # For FFmpeg video composition
+
+# --- Web & API Clients ---
+httpx                   # Async HTTP client for D-ID API
+pyppeteer               # For headless Chrome to render Chart.js
+
+# --- Utilities ---
+python-dotenv           # For loading .env files
