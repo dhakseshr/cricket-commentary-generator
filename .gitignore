@@ -1,2 +1,28 @@
-env/
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files
+.env
+*.env.*
+
+# Output directory
+output/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+venv/
 .venv/
+env/
+*.egg-info/
+dist/
+build/
