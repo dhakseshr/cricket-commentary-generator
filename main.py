@@ -246,8 +246,10 @@ def run_commentary_pipeline(match_data_filepath, avatar_id, voice_id):
     if composition_success:
         print(f"✅ Final video generated successfully:")
         print(f"   {output_filepath}")
+        return output_filepath  # <-- ADD THIS LINE
     else:
         print(f"❌ Video composition failed. Check FFmpeg logs printed above.")
+        return None  # <-- ADD THIS LINE
 
 # --- Script Execution ---
 if __name__ == "__main__":
