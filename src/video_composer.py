@@ -129,8 +129,9 @@ def compose_video_ffmpeg_with_crossfade(
 
         if is_image:
             img_width, img_height = target_width, target_height
-            duration = default_chart_duration
-
+            # Use default_chart_duration for images
+            duration = default_chart_duration 
+            
             safe_base = "".join([c if c.isalnum() else "_" for c in base_name])[:50]
             # Use absolute path for temp file in the output directory
             temp_video_path = os.path.join(output_dir, f"temp_img_{i}_{safe_base}.mp4")
@@ -143,7 +144,8 @@ def compose_video_ffmpeg_with_crossfade(
                     .filter('scale', size=f'{img_width}x{img_height}', force_original_aspect_ratio='decrease', flags='bicubic')
                     .filter('pad', w=img_width, h=img_height, x='(ow-iw)/2', y='(oh-ih)/2', color='black')
                     .filter('setsar', sar='1/1')
-                    .output(temp_video_path, pix_fmt='yuv420p', vf=f'fps={target_fps}', video_bitrate='4000k', preset='medium', an=None)
+                    .filter('fps', fps=target_fps)
+                    .output(temp_video_path, pix_fmt='yuv420p', video_bitrate='4000k', preset='medium', an=None)
                     .overwrite_output()
                     .run(capture_stdout=True, capture_stderr=True, quiet=False) # Log stderr
                 )
@@ -151,17 +153,24 @@ def compose_video_ffmpeg_with_crossfade(
                 if os.path.exists(temp_video_path):
                      # Probe the temp video using its absolute path
                      temp_duration, _, _, _ = get_video_info(temp_video_path)
+                     # Use the *probed* duration, which should be very close to default_chart_duration
                      if temp_duration is not None and temp_duration > 0:
-                          # Store the absolute path to the temp file
                           inputs_info.append({'path': temp_video_path, 'duration': temp_duration, 'width': img_width, 'height': img_height, 'has_audio': False, 'is_temp': True})
                           temp_files.append(temp_video_path)
-                          print(f"  -> Created temp video: {os.path.basename(temp_video_path)}")
+                          print(f"  -> Created temp video: {os.path.basename(temp_video_path)} (Duration: {temp_duration:.2f}s)")
                           valid_clips_exist = True
                           if not first_video_dims_found:
                                final_video_width, final_video_height = img_width, img_height
                                first_video_dims_found = True
-                     else: print(f"  -> ❌ Failed probe/validate temp video from {base_name}")
-                else: print(f"  -> ❌ Failed: Temp video not created for {base_name}")
+                     else: 
+                          print(f"  -> ❌ Failed probe/validate temp video from {base_name}")
+                          # Even if probe fails, add a placeholder with the intended duration
+                          inputs_info.append({'path': temp_video_path, 'duration': duration, 'width': img_width, 'height': img_height, 'has_audio': False, 'is_temp': True})
+                          temp_files.append(temp_video_path) # Still need to clean it up
+                          print(f"  -> ⚠️ Warning: Using fallback duration ({duration:.2f}s) for {base_name}")
+                          valid_clips_exist = True # Assume it's valid
+                else: 
+                    print(f"  -> ❌ Failed: Temp video not created for {base_name}")
 
             except ffmpeg.Error as e:
                 stderr_text = e.stderr.decode(errors='ignore') if e.stderr else str(e)
@@ -186,45 +195,84 @@ def compose_video_ffmpeg_with_crossfade(
                  print(f"Warning: Skipping video due to invalid info or zero duration: {base_name}")
 
 
-    # --- Rest of the function remains identical ---
-    # It will now use the absolute paths stored in inputs_info['path']
-
     if not valid_clips_exist or not inputs_info:
         print("❌ ERROR: No valid input clips found after pre-processing.")
         cleanup_temp_files(temp_files)
         return False
 
+    if not first_video_dims_found:
+        print("⚠️ Warning: No video dimensions found; defaulting to target.")
+        
     target_width, target_height = final_video_width, final_video_height
     print(f"Using target resolution: {target_width}x{target_height}, FPS: {target_fps}")
 
+    # --- CALCULATE MASTER TIMELINE ---
+    print("\n--- [Composer] Calculating master timeline ---")
+    clip_start_times = [] # This will hold the start time (in seconds) for each clip
+    current_offset_s = 0.0
+    for i, info in enumerate(inputs_info):
+        clip_start_times.append(current_offset_s)
+        print(f"  Clip {i} ({os.path.basename(info['path'])}) starts at {current_offset_s:.2f}s")
+        
+        # Add the effective duration of this clip to the offset
+        # The last clip adds its *full* duration
+        clip_effective_duration = info['duration'] - (transition_duration if i < len(inputs_info) - 1 else 0)
+        clip_effective_duration = max(0.01, clip_effective_duration)
+        current_offset_s += clip_effective_duration
+    
+    final_duration_estimate = current_offset_s # The final offset is the total duration
+    print(f"  Total estimated duration: {final_duration_estimate:.2f}s")
+
+
     print("\n--- [Composer] Building Filtergraph ---")
     video_inputs_processed = []
-    audio_inputs_processed = []
+    audio_streams_for_mixing = []
     target_sample_rate = '44100'
 
     for i, info in enumerate(inputs_info):
         try:
             # Input uses the absolute path stored in info['path']
-            stream = ffmpeg.input(info['path'])
+            # Add 't' (duration) to the input args for safety, esp. for images
+            stream = ffmpeg.input(info['path'], t=info['duration'])
             v_stream = stream['v']
+            
             # Scale/Pad if needed
             stream_w = info.get('width', 0)
             stream_h = info.get('height', 0)
             if stream_w != target_width or stream_h != target_height:
                  v_stream = v_stream.filter('scale', size=f'{target_width}x{target_height}', force_original_aspect_ratio='decrease', flags='bicubic')
                  v_stream = v_stream.filter('pad', w=target_width, h=target_height, x='(ow-iw)/2', y='(oh-ih)/2', color='black')
-            v_stream = v_stream.filter('fps', fps=target_fps, round='near').filter('setsar', sar='1/1')
+            
+            # Standardize video
+            v_stream = v_stream.filter('fps', fps=target_fps, round='near') \
+                               .filter('setsar', sar='1/1') \
+                               .filter('format', pix_fmts='yuv420p')
+            
             video_inputs_processed.append(v_stream)
 
-            # Audio
+            # --- AUDIO SYNCHRONIZATION LOGIC ---
+            
+            # 1. Get base audio stream (or silence for images/silent videos)
             actual_duration = info.get('duration', default_chart_duration)
             if info['has_audio']:
                 a_stream = stream['a'].filter('aformat', sample_fmts='fltp', sample_rates=target_sample_rate, channel_layouts='stereo')
-                a_stream = a_stream.filter('aresample', resampler='soxr')
-                audio_inputs_processed.append(a_stream)
+                a_stream = a_stream.filter('aresample')
             else:
+                 # Create silence *only* for this clip's duration
                  silence = ffmpeg.input(f'anullsrc=channel_layout=stereo:sample_rate={target_sample_rate}', format='lavfi', t=actual_duration)['a']
-                 audio_inputs_processed.append(silence)
+                 a_stream = silence
+            
+            # 2. Get the pre-calculated start time for this clip
+            start_time_s = clip_start_times[i]
+            start_time_ms = int(start_time_s * 1000)
+
+            # 3. Apply 'adelay' to shift this audio to its correct start time
+            #    The 'delays' param needs a value for each channel (e.g., "1000|1000" for stereo)
+            delayed_audio = a_stream.filter('adelay', delays=f'{start_time_ms}|{start_time_ms}')
+            
+            # 4. Add the *delayed* stream to the list for final mixing
+            audio_streams_for_mixing.append(delayed_audio)
+            
         except Exception as e:
             print(f"  ❌ Error processing input stream for {os.path.basename(info['path'])}: {e}")
             cleanup_temp_files(temp_files)
@@ -232,37 +280,35 @@ def compose_video_ffmpeg_with_crossfade(
 
     # Apply transitions
     if len(inputs_info) > 1:
+        # --- VIDEO FADE (using master timeline) ---
         processed_video = video_inputs_processed[0]
-        video_offset = 0.0
         for i in range(1, len(inputs_info)):
-             prev_effective_duration = inputs_info[i-1]['duration'] - (transition_duration if i > 1 else 0)
-             offset = video_offset + max(0.01, prev_effective_duration)
+             # Use the start time from our master timeline as the offset
+             offset_s = clip_start_times[i] 
              processed_video = ffmpeg.filter(
                 [processed_video, video_inputs_processed[i]], 'xfade',
-                transition='fade', duration=transition_duration, offset=offset
-            ).node
-             video_offset = offset
-
-        processed_audio = audio_inputs_processed[0]
-        for i in range(1, len(inputs_info)):
-             safe_transition_duration = max(0.01, transition_duration)
-             processed_audio = ffmpeg.filter(
-                  [processed_audio, audio_inputs_processed[i]], 'acrossfade',
-                  duration=safe_transition_duration, curve1='tri', curve2='tri'
-             ).node
-
-        final_duration_estimate = sum(info['duration'] for info in inputs_info) - (len(inputs_info) - 1) * transition_duration
+                transition='fade', duration=transition_duration, offset=offset_s
+            )
+        
+        # --- *** THE CRITICAL FIX IS HERE *** ---
+        print("  Mixing audio streams...")
+        processed_audio = ffmpeg.filter(
+            audio_streams_for_mixing, 'amix',
+            inputs=len(audio_streams_for_mixing),
+            duration='longest' # <-- FIX: Was 'first', now 'longest'
+        )
+        # --- *** END CRITICAL FIX *** ---
 
     elif len(inputs_info) == 1:
         processed_video = video_inputs_processed[0]
-        processed_audio = audio_inputs_processed[0]
-        final_duration_estimate = inputs_info[0]['duration']
+        processed_audio = audio_streams_for_mixing[0] # Use the (undelayed) stream
     else:
         print("❌ ERROR: No processed inputs available for composition.")
         cleanup_temp_files(temp_files)
         return False
 
     # Optional Background Music
+    # This logic is now correct, as 'processed_audio' is the synced master track
     final_audio_stream = processed_audio
     abs_bgm_path = os.path.abspath(bg_music_path) if bg_music_path and not os.path.isabs(bg_music_path) else bg_music_path
     if abs_bgm_path and os.path.exists(abs_bgm_path):
@@ -279,11 +325,13 @@ def compose_video_ffmpeg_with_crossfade(
                  .filter('atrim', duration=final_duration_estimate)
                  .filter('volume', volume=bg_music_volume)
                  .filter('aformat', sample_fmts='fltp', sample_rates=target_sample_rate, channel_layouts='stereo')
-                 .filter('aresample', resampler='soxr')
+                 .filter('aresample')
              )
+             # This amix is correct with 'duration=first' because 'processed_audio'
+             # is the first input and defines the final, correct length.
              final_audio_stream = ffmpeg.filter(
                   [processed_audio, bgm_audio], 'amix', inputs=2, duration='first', dropout_transition=transition_duration*2
-             ).node
+             )
              print("  -> Background music prepared for mixing.")
         except Exception as e:
             print(f"  ⚠️ Warning: Error processing background music: {e}. Skipping BGM.")
@@ -294,11 +342,11 @@ def compose_video_ffmpeg_with_crossfade(
     try:
         output_args = {
             'vcodec': 'libx264', 'pix_fmt': 'yuv420p', 'r': target_fps,
-            'crf': 23, 'preset': 'medium', 'movflags': '+faststart',
+            'crf': 23, 'preset': 'medium', 'b:v': '4000k','movflags': '+faststart',
             'acodec': 'aac', 'audio_bitrate': '128k', 'ar': int(target_sample_rate),
             'strict': '-2',
-            'shortest': None,
-            'y': None
+            #'shortest': None, # Do not use 'shortest' with this timeline logic
+            'y': None # Overwrite output without asking
         }
         # Use output_abs_filepath
         stream = ffmpeg.output(processed_video, final_audio_stream, output_abs_filepath, **output_args)
